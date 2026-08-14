@@ -27,6 +27,13 @@ node = cluster.add_instance(
     with_azurite=True,
     with_zookeeper=True,
 )
+# Second replica for the packed-fetch verification test (DataPartsExchange downloadPartToDisk).
+node2 = cluster.add_instance(
+    "node2",
+    main_configs=[os.path.join(SCRIPT_DIR, "configs", "azure_disk.xml")],
+    with_azurite=True,
+    with_zookeeper=True,
+)
 
 # kind -> (one-shot fp, permanent fp, expected error text)
 ERROR_KINDS = {
@@ -48,7 +55,8 @@ ERROR_KINDS = {
 }
 
 ALL_FAILPOINTS = [fp for triple in ERROR_KINDS.values() for fp in triple[:2]] + [
-    "azure_inject_bad_request"
+    "azure_inject_bad_request",
+    "check_data_part_retryable_error",
 ]
 
 # The OSS-observable signal that reportBroken() was taken (part-check thread).
@@ -304,3 +312,52 @@ def test_check_table_surfaces_transient_not_verified(started_cluster):
         node.query("SYSTEM DISABLE FAILPOINT azure_inject_forbidden_response")
 
     node.query("DROP TABLE IF EXISTS t_check_mt SYNC")
+
+
+def test_packed_fetch_checkdatapart_retryable_not_published(started_cluster):
+    # Regression for DataPartsExchange.cpp:971: on a packed replica-fetch, checkDataPart must rethrow a
+    # retryable error (not return empty) so the receiver retries instead of publishing an unverified part.
+    # A code failpoint injects the error at checkDataPart itself, since a wire 403 can't isolate that read.
+    def create(n, replica):
+        n.query("DROP TABLE IF EXISTS t_cdp SYNC")
+        n.query(
+            f"""
+            CREATE TABLE t_cdp (k UInt64, v String)
+            ENGINE = ReplicatedMergeTree('/clickhouse/t_cdp', '{replica}')
+            ORDER BY k
+            SETTINGS storage_policy = 'azure_policy',
+                     min_bytes_for_wide_part = 0,
+                     min_bytes_for_full_part_storage = 1073741824
+            """
+        )
+
+    try:
+        create(node, "r1")
+        create(node2, "r2")
+
+        node2.query("SYSTEM STOP FETCHES t_cdp")
+        node.query("INSERT INTO t_cdp SELECT number, toString(number) FROM numbers(100)")
+        assert node.query("SELECT count() FROM t_cdp").strip() == "100"
+
+        node2.query("SYSTEM DROP FILESYSTEM CACHE")
+        node2.query("SYSTEM DROP MARK CACHE")
+        node2.query("SYSTEM ENABLE FAILPOINT check_data_part_retryable_error")
+        node2.query("SYSTEM START FETCHES t_cdp")
+
+        # checkDataPart rethrows -> fetch fails and retries -> the unverified part must NOT be published.
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            assert (
+                node2.query("SELECT count() FROM t_cdp").strip() == "0"
+            ), "node2 published a part whose checkDataPart raised a retryable error (checkDataPart:971 regression)"
+            time.sleep(1)
+        assert not node2.contains_in_log(BROKEN_PART_LOG)
+
+        # Clear the injected error: the fetch retries, checkDataPart passes, and the part is published.
+        node2.query("SYSTEM DISABLE FAILPOINT check_data_part_retryable_error")
+        node2.query("SYSTEM SYNC REPLICA t_cdp", timeout=90)
+        assert node2.query("SELECT count() FROM t_cdp").strip() == "100"
+    finally:
+        node2.query("SYSTEM DISABLE FAILPOINT check_data_part_retryable_error")
+        node.query("DROP TABLE IF EXISTS t_cdp SYNC")
+        node2.query("DROP TABLE IF EXISTS t_cdp SYNC")

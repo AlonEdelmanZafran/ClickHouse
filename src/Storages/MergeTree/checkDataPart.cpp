@@ -18,6 +18,7 @@
 #include <Common/SipHash.h>
 #include <Common/ZooKeeper/IKeeper.h>
 #include <Common/ErrnoException.h>
+#include <Common/FailPoint.h>
 #include <IO/AzureBlobStorage/isRetryableAzureException.h>
 #if USE_AZURE_BLOB_STORAGE
 #include <azure/core/credentials/credentials.hpp>
@@ -56,6 +57,11 @@ namespace ErrorCodes
     extern const int ABORTED;
     extern const int CANNOT_WRITE_TO_OSTREAM;
     extern const int CACHE_CANNOT_WRITE_TO_CACHE_DISK;
+}
+
+namespace FailPoints
+{
+    extern const char check_data_part_retryable_error[];
 }
 
 
@@ -174,6 +180,12 @@ static IMergeTreeDataPart::Checksums checkDataPart(
 
     CurrentMetrics::Increment metric_increment{CurrentMetrics::ReplicatedChecks};
     Poco::Logger * log = &Poco::Logger::get("checkDataPart");
+
+    /// Test-only: make checkDataPart's read raise a retryable error, after the part is on disk.
+    fiu_do_on(FailPoints::check_data_part_retryable_error,
+    {
+        throw Poco::TimeoutException("Injected transient error into checkDataPart");
+    });
 
     NamesAndTypesList columns_txt;
 
