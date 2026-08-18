@@ -51,9 +51,17 @@ class Git:
         dry_run: bool = False,
         strict: bool = False,
         retries: int = 1,
+        rebase_retries: int = 0,
+        git_prefix: str = "git",
         verbose: bool = True,
     ) -> bool:
         """Push `refspec` to `repo` over HTTPS with an App/PAT token.
+
+        `rebase_retries` > 0 heals a non-fast-forward rejection (a concurrent
+        push advanced the branch): fetch the pushed branch and rebase the local
+        commits onto its new tip — using `git_prefix` for the committer identity
+        — then retry, up to `rebase_retries` times. Requires `refspec` to be
+        `HEAD:refs/heads/<branch>`; ignored on a dry run.
 
         The token is `$GH_TOKEN` when the caller has one exported (the release
         job sets it to the robot PAT, which carries the `workflow` scope), else
@@ -71,9 +79,9 @@ class Git:
         credentials), so the token never reaches the log while the push command
         and retry attempts stay visible.
         """
-        # Log the files changed by the pushed commit, so it is visible whether
-        # the push touches .github/workflows (the trigger for GitHub's
-        # workflows-scope check).
+        # Log what will be pushed: the parameters and the commit's files, so it
+        # is visible whether the push touches .github/workflows (the trigger for
+        # GitHub's workflows-scope check).
         src_ref = refspec.split(":", 1)[0]
         commit = Shell.get_output(
             f"git rev-list -n1 {shlex.quote(src_ref)}", verbose=False
@@ -85,7 +93,13 @@ class Git:
             if commit
             else ""
         )
+        print(
+            f"Push [{refspec}] -> [{repo}] (force={force}, retries={retries}, "
+            f"rebase_retries={rebase_retries}, dry_run={dry_run})"
+        )
         print(f"Files in pushed commit [{src_ref} -> {commit}]:\n{files or '(none)'}")
+        if dry_run:
+            return True
 
         repo_url = (
             "https://x-access-token:${token}@github.com/" + shlex.quote(repo) + ".git"
@@ -96,12 +110,32 @@ class Git:
             "git -c http.https://github.com/.extraheader= push "
             f"{force_flag}{repo_url} {shlex.quote(refspec)}"
         )
-        return Shell.check(
-            push_cmd,
-            dry_run=dry_run,
-            strict=strict,
-            verbose=verbose,
-            retries=retries,
+        if not rebase_retries:
+            return Shell.check(
+                push_cmd, strict=strict, verbose=verbose, retries=retries
+            )
+        branch = refspec.split(":", 1)[-1]
+        if branch.startswith("refs/heads/"):
+            branch = branch[len("refs/heads/") :]
+        # attempt 0 is the initial push; each later attempt rebases onto the
+        # advanced tip first, so `rebase_retries` push retries follow it.
+        for attempt in range(rebase_retries + 1):
+            if attempt:
+                print(
+                    f"Push to {branch} rejected; re-syncing and retrying {attempt}/{rebase_retries}"
+                )
+                Shell.check(
+                    f"{git_prefix} fetch --quiet origin {shlex.quote(branch)}",
+                    strict=True,
+                    verbose=verbose,
+                )
+                Shell.check(
+                    f"{git_prefix} rebase FETCH_HEAD", strict=True, verbose=verbose
+                )
+            if Shell.check(push_cmd, strict=False, verbose=verbose, retries=retries):
+                return True
+        raise RuntimeError(
+            f"Failed to push {refspec} to {repo} after {rebase_retries} rebase attempts"
         )
 
     @staticmethod
